@@ -1,0 +1,247 @@
+---
+title: "Ridge and LASSO Modeling for DC Crime"
+subtitle: "Regularized regression on 2020–2026 incident data"
+author: "Assem Mendygaziyeva"
+date: "2026-02-16"
+format:
+  html: default
+  docx: default
+---
+
+## 
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=T, warning=FALSE, message=FALSE)
+```
+
+```{r}
+setwd("/Users/assemmendygaziyeva/Desktop")
+crime <- read.csv("all_crime_incidents_2020-2026.csv")
+
+head(crime)
+```
+
+# **Business Case and Analytic Question**
+
+Our team’s project focuses on helping DC public safety agencies decide where and when to prioritize policing, environmental design, and social programs based on recent crime patterns. The team analytic question is: *How do temporal features (such as month and shift) and location characteristics (such as ward and neighborhood areas) jointly predict crime levels and types, and how can these patterns inform deployment recommendations?* In this Deliverable report, I use ridge and LASSO regression models to predict monthly crime counts by ward and crime type, so that we can identify which wards and crime categories consistently drive higher incident volumes and support more targeted resource allocation decisions.
+
+# **Data Preparation and Cleaning**
+
+For this work I start from our combined 2020–2026 DC incident‑level dataset, which contains one row per reported crime and fields such as REPORT_DAT, OFFENSE, WARD, SHIFT, and location identifiers. I first convert REPORT_DAT to a Date variable (DATE), cast WARD and SHIFT as factors, and filter out rows with missing ward values; I then summarize incidents by month (using floor_date(DATE, "month")), WARD, SHIFT, and OFFENSE to obtain a TOTAL_INCIDENTS count for each group. Next, I recode the detailed OFFENSE categories into four broader crime_type groups (homicide, robbery_burglary, theft, and sex_abuse/arson/assault) and aggregate again by month, crime_type, and WARD to produce the modeling table df_counts, where each row contains the total_crime_count for that month–crime_type–ward combination. This aggregated dataset removes duplicated incident records, handles missing wards, and creates a clean, structured outcome and predictor set suitable for fitting and comparing ridge and LASSO models.
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+
+# Create DATE, factor WARD and SHIFT
+all_crimes <- crime |>
+  mutate(
+    DATE = as.Date(REPORT_DAT),
+    WARD = as.factor(WARD),
+    SHIFT = as.factor(SHIFT)
+  )
+
+# Variables used for initial counts
+group_vars <- c("WARD", "SHIFT", "OFFENSE")
+
+# Count incidents by month, ward, shift, offense
+df_counts_summarized <- all_crimes |>
+  filter(!is.na(WARD)) |>
+  group_by(
+    month = floor_date(DATE, "month"),
+    across(all_of(group_vars))
+  ) |>
+  summarise(
+    TOTAL_INCIDENTS = n(),
+    .groups = "drop"
+  )
+
+# Recode OFFENSE into four crime_type groups and sum to total_crime_count
+df_counts <- df_counts_summarized |>
+  mutate(
+    crime_type = case_when(
+      str_detect(OFFENSE, "THEFT F/AUTO|THEFT/OTHER|MOTOR VEHICLE THEFT") ~ "theft",
+      str_detect(OFFENSE, "HOMICIDE") ~ "homicide",
+      str_detect(OFFENSE, "ROBBERY|BURGLARY") ~ "robbery_burglary",
+      TRUE ~ "sex_abuse/arson/assault"
+    ),
+    crime_type = factor(
+      crime_type,
+      levels = c("homicide", "robbery_burglary", "theft", "sex_abuse/arson/assault")
+    )
+  ) |>
+  group_by(month, crime_type, WARD) |>
+  summarise(
+    total_crime_count = sum(TOTAL_INCIDENTS),
+    .groups = "drop"
+  )
+
+
+```
+
+```{r}
+library(glmnet)
+
+# Model matrix with dummy variables (glmnet needs numeric x)
+x <- model.matrix(
+  total_crime_count ~ month + crime_type + WARD,
+  data = df_counts
+)[, -1]  # drop intercept column
+
+# Outcome vector
+y <- df_counts$total_crime_count
+
+# Train/test split (70% train, 30% test)
+set.seed(621)
+n <- nrow(df_counts)
+train_idx <- sample(1:n, size = floor(0.7 * n))
+
+x_train <- x[train_idx, ]
+y_train <- y[train_idx]
+
+x_test  <- x[-train_idx, ]
+y_test  <- y[-train_idx]
+
+```
+
+## Model 1: Ridge (lambda.min)
+
+Mild shrinkage, keeps all variables
+
+```{r}
+# Cross-validated ridge regression (alpha = 0), using lambda.min
+set.seed(621)
+cv_ridge <- cv.glmnet(
+  x_train, y_train,
+  alpha = 0,          # 0 = ridge
+  family = "gaussian"
+)
+
+lambda_ridge_min <- cv_ridge$lambda.min
+
+ridge_min <- glmnet(
+  x_train, y_train,
+  alpha = 0,
+  lambda = lambda_ridge_min,
+  family = "gaussian"
+)
+
+ridge_min_pred <- predict(ridge_min, newx = x_test)
+ridge_min_rmse <- sqrt(mean((y_test - ridge_min_pred)^2))
+ridge_min_rmse
+
+
+```
+
+## Model 2: Ridge (lambda.1se)
+
+Stronger shrinkage, but still keeps all variables.
+
+```{r}
+# Ridge regression with stronger penalty (lambda.1se)
+lambda_ridge_1se <- cv_ridge$lambda.1se
+
+ridge_1se <- glmnet(
+  x_train, y_train,
+  alpha = 0,
+  lambda = lambda_ridge_1se,
+  family = "gaussian"
+)
+
+ridge_1se_pred <- predict(ridge_1se, newx = x_test)
+ridge_1se_rmse <- sqrt(mean((y_test - ridge_1se_pred)^2))
+ridge_1se_rmse
+
+```
+
+## Model 3: LASSO (lambda.min)
+
+Shrinkage + can set small effects close to zero
+
+```{r}
+
+# Cross-validated LASSO regression (alpha = 1), using lambda.min
+set.seed(621)
+cv_lasso <- cv.glmnet(
+  x_train, y_train,
+  alpha = 1,          # 1 = LASSO
+  family = "gaussian"
+)
+
+lambda_lasso_min <- cv_lasso$lambda.min
+
+lasso_min <- glmnet(
+  x_train, y_train,
+  alpha = 1,
+  lambda = lambda_lasso_min,
+  family = "gaussian"
+)
+
+lasso_min_pred <- predict(lasso_min, newx = x_test)
+lasso_min_rmse <- sqrt(mean((y_test - lasso_min_pred)^2))
+lasso_min_rmse
+
+# Coefficients to see selected variables
+coef(lasso_min)
+
+```
+
+## Model 4: LASSO (lambda.1se)
+
+Even stronger penalty, drops more variables (more zeros)
+
+```{r}
+# LASSO regression with stronger penalty (lambda.1se)
+lambda_lasso_1se <- cv_lasso$lambda.1se
+
+lasso_1se <- glmnet(
+  x_train, y_train,
+  alpha = 1,
+  lambda = lambda_lasso_1se,
+  family = "gaussian"
+)
+
+lasso_1se_pred <- predict(lasso_1se, newx = x_test)
+lasso_1se_rmse <- sqrt(mean((y_test - lasso_1se_pred)^2))
+lasso_1se_rmse
+
+# Sparser coefficient pattern
+coef(lasso_1se)
+
+```
+
+In the LASSO (lambda.1se) model, the largest positive coefficient is for theft, confirming that theft-related incidents drive the highest monthly volumes across wards, while robbery/burglary also increases expected counts but to a smaller degree. Several ward effects remain non‑zero (e.g., Ward 2 positive, Wards 3 and 4 negative), indicating that some wards consistently experience higher or lower crime counts than the reference ward after controlling for crime type and time.
+
+## Compare all four models
+
+RMSE comparison across models
+
+```{r}
+rmse_results <- tibble(
+  model = c(
+    "Ridge (lambda.min)",
+    "Ridge (lambda.1se)",
+    "LASSO (lambda.min)",
+    "LASSO (lambda.1se)"
+  ),
+  RMSE = c(
+    ridge_min_rmse,
+    ridge_1se_rmse,
+    lasso_min_rmse,
+    lasso_1se_rmse
+  )
+)
+
+rmse_results
+
+
+```
+
+# **Model Performance Summary**
+
+Across the four regularized models, test RMSE values range from about 41.1 to 42.5, indicating broadly similar predictive performance. LASSO with lambda.min achieves the lowest RMSE (\~41.1), followed closely by ridge with lambda.min (\~41.6), while the stronger-penalty models (ridge and LASSO with lambda.1se) have slightly higher RMSEs around 42–42.5. These results suggest that all four specifications capture the main crime patterns similarly well when using month, crime_type, and WARD as predictors.
+
+# **Recommended Model and Rationale**
+
+I tested four regularized models (two ridge, two LASSO) to predict monthly crime counts by ward and crime type, all using the same predictors (month, crime_type, WARD). Their test RMSE values are very similar: they all miss by about 41–43 crimes on average, with LASSO lambda.min at \~41.1 and LASSO lambda.1se at \~42.1. Because these accuracy numbers are so close, it is reasonable to treat the models as having similar predictive performance and to prioritize simplicity. My LASSO (lambda.1se) model applies a stronger penalty, which shrinks more coefficients all the way to zero and drops month and several crime_type/ward effects, keeping only the strongest signals—especially theft and a subset of wards with consistently higher or lower crime. This simpler model still predicts about as well as the more complex versions but gives a clearer story for decision‑makers, highlighting which crime types and wards matter most for planning deployments without being cluttered by small, noisy effects. For that reason, I recommend LASSO with lambda.1se as my final model: it balances good predictive accuracy with a more interpretable and operationally useful set of drivers of crime counts.
